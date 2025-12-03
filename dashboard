@@ -1,0 +1,120 @@
+# disaster_dashboard.py
+import streamlit as st
+import pandas as pd
+import folium
+from streamlit_folium import st_folium
+import requests
+from datetime import datetime, timedelta
+import openai  # or use grok, anthropic, etc.
+
+# ============= CONFIG =============
+st.set_page_config(page_title="AI Emergency Response Dashboard", layout="wide")
+st.title("🌍 AI-Powered Natural Disaster Emergency Response Dashboard")
+st.sidebar.header("Controls")
+
+# Option to use free AI or your own key
+ai_provider = st.sidebar.selectbox("AI Provider", ["OpenAI (GPT)", "xAI Grok (via API)", "Local LLM (Ollama)"])
+
+if ai_provider == "OpenAI (GPT)":
+    openai.api_key = st.sidebar.text_input("OpenAI API Key", type="password")
+elif ai_provider == "xAI Grok (via API)":
+    st.sidebar.info("Use Groq (fast & free tier): https://console.groq.com")
+    openai.api_key = st.sidebar.text_input("Groq API Key", type="password")
+    openai.api_base = "https://api.groq.com/openai/v1"
+
+# ============= FETCH DISASTER DATA =============
+@st.cache_data(ttl=300)  # Update every 5 minutes
+def get_earthquakes():
+    url = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_week.geojson"
+    data = requests.get(url).json()
+    quakes = []
+    for f in data['features']:
+        p = f['properties']
+        c = f['geometry']['coordinates']
+        quakes.append({
+            'type': 'Earthquake',
+            'mag': p['mag'],
+            'place': p['place'],
+            'time': datetime.fromtimestamp(p['time']/1000),
+            'lat': c[1],
+            'lon': c[0],
+            'url': p['url']
+        })
+    return pd.DataFrame(quakes)
+
+@st.cache_data(ttl=300)
+def get_gdacs_alerts():
+    url = "https://www.gdacs.org/xml/rss.xml"
+    import xml.etree.ElementTree as ET
+    response = requests.get(url)
+    root = ET.fromstring(response.content)
+    alerts = []
+    for item in root.findall('.//item'):
+        title = item.find('title').text
+        link = item.find('link').text
+        desc = item.find('description').text
+        alerts.append({'type': 'GDACS Alert', 'title': title, 'desc': desc, 'url': link})
+    return alerts
+
+@st.cache_data(ttl=600)
+def get_active_fires():
+    url = "https://firms.modaps.eosdis.nasa.gov/api/area/csv/YOUR_MAP_KEY/VIIRS_SNPP_SP/1/2025-12-01"  # Update date
+    st.info("🔥 Get free NASA FIRMS key: https://firms.modaps.eosdis.nasa.gov/api/map_key/")
+    return pd.DataFrame()  # Placeholder
+
+# ============= AI SUMMARY FUNCTION =============
+def get_ai_summary(event_description):
+    if not openai.api_key or openai.api_key.strip() == "":
+        return " sk-abcdef1234567890abcdef1234567890abcdef12"
+    
+    try:
+        response = openai.ChatCompletion.create(
+            model="llama3-8b-8192" if "groq" in openai.api_base else "gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are an emergency response AI expert. Summarize the disaster impact and suggest immediate actions in 3 bullet points."},
+                {"role": "user", "content": event_description}
+            ],
+            max_tokens=200
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"AI Error: {str(e)}"
+
+# ============= LOAD DATA =============
+with st.spinner("Fetching latest disasters..."):
+    earthquakes = get_earthquakes()
+    gdacs = get_gdacs_alerts()
+
+st.success(f"Updated: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}")
+
+# ============= MAP =============
+m = folium.Map(location=[20, 0], zoom_start=2, tiles="CartoDB positron")
+
+# Add Earthquakes
+for _, row in earthquakes.iterrows():
+    color = "red" if row['mag'] > 6 else "orange" if row['mag'] > 5 else "yellow"
+    folium.CircleMarker(
+        location=[row['lat'], row['lon']],
+        radius=row['mag'] * 3,
+        color=color,
+        fill=True,
+        popup=f"<b>{row['mag']} Magnitude</b><br>{row['place']}<br>{row['time']}"
+    ).add_to(m)
+
+st_map = st_folium(m, width=1200, height=600)
+
+# ============= ALERTS & AI =============
+st.subheader("🚨 Latest Critical Alerts (GDACS)")
+
+for alert in gdacs[:10]:
+    with st.expander(f"⚠️ {alert['title']}"):
+        st.write(alert['desc'])
+        if st.button("Generate AI Response Plan", key=alert['url']):
+            with st.spinner("AI is thinking..."):
+                summary = get_ai_summary(alert['title'] + " " + alert['desc'])
+                st.success(summary)
+
+# ============= SIDEBAR STATS =============
+st.sidebar.metric("Major Earthquakes (Last 7 days)", len(earthquakes))
+st.sidebar.metric("GDACS Active Alerts", len(gdacs))
+st.sidebar.info("Data Sources: USGS, GDACS, NASA FIRMS, EONET")
